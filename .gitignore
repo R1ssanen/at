@@ -1,0 +1,7 @@
+.cache
+analysis
+build
+test.c
+*.sh
+CMakeLists.txt
+
