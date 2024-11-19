@@ -8,14 +8,9 @@
 #define AT_H
 
 #include <pthread.h>
-#include <stdarg.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
-
-#define true  1
-#define false 0
 
 typedef _Bool    b8;
 typedef int8_t   i8;
@@ -29,103 +24,128 @@ typedef uint64_t u64;
 typedef float    f32;
 typedef double   f64;
 
-static inline void
-_at_LogAssertMsg(const char* expr, const char* file, i32 line, const char* fmt, ...) {
-    char    msg[1024];
-    va_list args;
-    va_start(args, fmt);
-    vsprintf(msg, fmt, args);
-    va_end(args);
-
-    fprintf(
-        stderr, "(AT) Assertion [ %s ] failed\n\tat line %i\n\tof %s\n\twith message '%s'.\n", expr,
-        line, file, msg
-    );
-}
-
-#ifndef NDEBUG
-#    define _at_ASSERT_MSG(expr, ...)                                                              \
-        do {                                                                                       \
-            if (!(expr)) {                                                                         \
-                _at_LogAssertMsg(#expr, __FILE__, __LINE__, __VA_ARGS__);                          \
-                abort();                                                                           \
-            }                                                                                      \
-        } while (false);
-#else
-#    define _at_ASSERT                                                                             \
-        do {                                                                                       \
-        } while (false);
-#endif
-
+#define true  1
+#define false 0
 #define _at_FORWARD_DECL
 
-typedef enum {
-    AT_SUCCESS     = 0,
-    AT_FAILURE     = 0x000001,
-    AT_NULL_INPUT  = 0x000011,
-    AT_NULL_OUTPUT = 0x000101,
-    AT_SYS_ERROR   = 0x001001,
-} at_return_t;
-
-typedef void* (*at_task_func_t)(void*);
+#define _at_LOCK(mtx)   pthread_mutex_lock(&mtx)
+#define _at_UNLOCK(mtx) pthread_mutex_unlock(&mtx)
 
 typedef pthread_mutex_t _at_mutex_t;
-typedef pthread_cond_t  _at_cond_t;
 typedef pthread_t       _at_pid_t;
-
-#define _at_LOCK(mtx)       pthread_mutex_lock(&mtx)
-#define _at_UNLOCK(mtx)     pthread_mutex_unlock(&mtx)
-#define _at_SIGNAL(cond)    pthread_cond_signal(&cond)
-#define _at_WAIT(cond, mtx) pthread_cond_wait(&cond, &mtx)
 
 typedef struct atTask   atTask;
 typedef struct atThread atThread;
 typedef struct atPool   atPool;
-
 typedef struct _atQNode _atQNode;
 typedef struct _atQueue _atQueue;
+typedef void* (*at_task_func_t)(void*);
+
+typedef enum {
+    AT_SUCCESS = 0,
+    AT_NULL_INPUT,
+    AT_SYS_ERROR,
+    AT_LIB_ERROR,
+} at_error_t;
+
+static inline const char* atGetErrorString(at_error_t err) {
+    switch (err) {
+    case AT_SUCCESS: return "(AT) No errors.";
+    case AT_NULL_INPUT: return "(AT) Invalid null function argument.";
+    case AT_SYS_ERROR: return "(AT) C-standard function returned an error.";
+    case AT_LIB_ERROR: return "(AT) External library function returned an error.";
+    default: return "(AT) Unknown error code.";
+    }
+}
 
 /*
  * QUEUE (internal)
  * */
 
+/**
+ * (internal)
+ * @class _atQNode
+ * @brief Thread queue node.
+ */
 struct _atQNode {
-    atThread* data;
+    atThread* thread;
     _atQNode* next;
 };
 
-// NOTE: all queue operations are thread-safe
+/**
+ * (internal)
+ * @class _atQueue
+ * @brief Thread queue.
+ */
 struct _atQueue {
-    _at_mutex_t lock;
+    _at_mutex_t lock; //!  NOTE: All queue operations are thread-safe
     _atQNode*   front;
     _atQNode*   back;
 };
 
+/**
+ * (internal)
+ * @brief Create thread queue.
+ * @return
+ */
 static inline _atQueue _atCreateQueue(void) {
     return (_atQueue){ .lock = PTHREAD_MUTEX_INITIALIZER, .front = NULL, .back = NULL };
 }
 
-b8 _at_FORWARD_DECL        _atQIsEmpty(_atQueue*);
-
 atThread* _at_FORWARD_DECL _atQDequeue(_atQueue*);
 
-static inline at_return_t  _atDestroyQueue(_atQueue* queue) {
+/**
+ * (internal)
+ * @brief Destroy thread queue.
+ * @param queue Queue to be destroyed.
+ * @return
+ */
+static inline at_error_t _atDestroyQueue(_atQueue* queue) {
     if (!queue) { return AT_NULL_INPUT; }
 
-    while (!_atQIsEmpty(queue)) {
-        if (!_atQDequeue(queue)) { return AT_FAILURE; }
-    }
+    while (_atQDequeue(queue));
+
+    if (pthread_mutex_destroy(&queue->lock)) { return AT_LIB_ERROR; }
 
     return AT_SUCCESS;
 }
 
-static inline at_return_t _atQEnqueue(_atQueue* queue, atThread* thread) {
-    if (!queue) { return AT_NULL_INPUT; }
+/**
+ * (internal)
+ * @brief Check if thread queue is empty.
+ * @param queue Queue to be checked.
+ * @param err Optional error code output. Nullable.
+ * @return
+ */
+static inline b8 _atQIsEmpty(_atQueue* queue, at_error_t* err) {
+    if (!queue) {
+        if (err) { *err = AT_NULL_INPUT; }
+        return false;
+    }
+
+    _at_LOCK(queue->lock);
+    b8 is_empty = (!queue->front) && (!queue->back);
+    _at_UNLOCK(queue->lock);
+
+    if (err) { *err = AT_SUCCESS; }
+    return is_empty;
+}
+
+/**
+ * (internal)
+ * @brief Enqueue thread to queue.
+ * @param queue Queue to enqueue to.
+ * @param thread Thread to enqueue.
+ * @return
+ */
+static inline at_error_t _atQEnqueue(_atQueue* queue, atThread* thread) {
+    if (!queue || !thread) { return AT_NULL_INPUT; }
 
     _atQNode* node = malloc(sizeof(_atQNode));
     if (!node) { return AT_SYS_ERROR; }
 
-    *node = (_atQNode){ .data = thread, .next = NULL };
+    node->thread = thread;
+    node->next   = NULL;
 
     _at_LOCK(queue->lock);
     {
@@ -142,72 +162,112 @@ static inline at_return_t _atQEnqueue(_atQueue* queue, atThread* thread) {
     return AT_SUCCESS;
 }
 
-b8 _atQIsEmpty(_atQueue* queue) {
-    _at_ASSERT_MSG(queue != NULL, "Cannot confirm if null queue is empty.");
-
-    _at_LOCK(queue->lock);
-    b8 is_empty = (!queue->front) && (!queue->back);
-    _at_UNLOCK(queue->lock);
-
-    return is_empty;
-}
-
+/**
+ * (internal)
+ * @brief Dequeue thread from queue.
+ * @param queue Queue to dequeue from.
+ * @return
+ */
 atThread* _atQDequeue(_atQueue* queue) {
-    _at_ASSERT_MSG(queue != NULL, "Cannot dequeue from a null queue.");
-    if (_atQIsEmpty(queue)) { return NULL; }
+    if (!queue || _atQIsEmpty(queue, NULL)) { return NULL; }
 
-    _atQNode* tmp       = NULL;
-    atThread* old_front = NULL;
+    _atQNode* old_front = NULL;
 
     _at_LOCK(queue->lock);
     {
-        tmp          = queue->front;
-        old_front    = tmp->data;
-
+        old_front    = queue->front;
         queue->front = queue->front->next;
         if (!queue->front) { queue->back = NULL; }
     }
     _at_UNLOCK(queue->lock);
 
-    free(tmp);
-    return old_front;
+    atThread* old_front_data = old_front->thread;
+    free(old_front);
+    return old_front_data;
 }
 
 /*
  * TASK
  * */
 
+/**
+ * @class atTask
+ * @brief Thread task return type.
+ */
 struct atTask {
-    _at_cond_t     ret_cond;
     _at_mutex_t    lock;
     at_task_func_t fn;
     void*          args;
     void*          ret;
+    u32            update_freq_ms;
+    _at_pid_t      pid; //! Thread associated with the task.
+    b8             done;
 };
 
-static inline atTask _atCreateTask(at_task_func_t fn, void* args) {
-    _at_ASSERT_MSG(fn != NULL, "Cannot create task with null function.");
+/**
+ * (internal)
+ * @brief Create a task.
+ * @param fn Function to execute.
+ * @param args Arguments to the function.
+ * @param update_freq_ms Frequence in which task checks whether it's
+ *                       been completed when awaiting, in seconds.
+ * @return
+ */
+static inline atTask _atCreateTask(at_task_func_t fn, void* args, f64 update_freq) {
+    return (atTask){ .lock           = PTHREAD_MUTEX_INITIALIZER,
+                     .fn             = fn,
+                     .args           = args,
+                     .ret            = NULL,
+                     .update_freq_ms = (u32)(update_freq * 1000.0),
+                     .done           = false };
+}
 
-    return (atTask){ .ret_cond = PTHREAD_COND_INITIALIZER,
-                     .lock     = PTHREAD_MUTEX_INITIALIZER,
-                     .fn       = fn,
-                     .args     = args,
-                     .ret      = NULL };
+/**
+ * (internal)
+ * @brief Destroy a task.
+ * @param task Task to be destroyed.
+ * @return
+ */
+static inline at_error_t _atDestroyTask(atTask* task) {
+    if (!task) { return AT_NULL_INPUT; }
+
+    if (pthread_mutex_destroy(&task->lock)) { return AT_LIB_ERROR; }
+
+    task->fn   = NULL;
+    task->args = NULL;
+    task->ret  = NULL;
+    task->pid  = 0;
+
+    return AT_SUCCESS;
 }
 
 atTask* _at_FORWARD_DECL atLaunchTask(at_task_func_t, void*, atThread*);
 
 atTask* _at_FORWARD_DECL atScheduleTask(at_task_func_t, void*, atPool*);
 
-static inline void*      atAwaitTask(atTask* task) {
-    _at_ASSERT_MSG(task != NULL, "Cannot await a null task.");
+/**
+ * @brief Await a task. You must always await a launched or
+ *        scheduled task before accessing its values to avoid a race condition.
+ * @param task Task to be awaited.
+ * @param err Optional error code output. Nullable.
+ */
+static inline void* atAwaitTask(atTask* task, at_error_t* err) {
+    if (!task) {
+        if (err) { *err = AT_NULL_INPUT; }
+        return NULL;
+    }
 
     _at_LOCK(task->lock);
-    _at_WAIT(task->ret_cond, task->lock);
+    {
+        while (!task->done) {
+            _at_UNLOCK(task->lock);
+            usleep(task->update_freq_ms);
+            _at_LOCK(task->lock);
+        }
+    }
     _at_UNLOCK(task->lock);
 
-    fputs("awaiting complete\n", stderr);
-
+    if (err) { *err = AT_SUCCESS; }
     return task->ret;
 }
 
@@ -215,45 +275,82 @@ static inline void*      atAwaitTask(atTask* task) {
  * THREAD
  * */
 
+/**
+ * @class atThread
+ * @brief Thread structure.
+ */
 struct atThread {
     atTask      task;
-    _at_cond_t  work_cond;
     _at_mutex_t lock;
     atPool*     pool;
     _at_pid_t   pid;
     u32         update_freq_ms;
-    b8          activated;
     b8          exit;
+    b8          working;
 };
 
-void* _at_FORWARD_DECL    _atThreadLoop(void*);
+void* _at_FORWARD_DECL _atThreadLoop(void*);
 
-static inline at_return_t atCreateThread(atPool* pool, f64 update_freq, atThread* thread) {
-    if (!thread) { return AT_NULL_OUTPUT; }
+/**
+ * @brief Create a thread.
+ * @param pool Pool to associate the thread with.
+ *             Can be null, in which case the thread is single.
+ * @param update_freq Frequency in which thread checks if it has work, in seconds.
+ *                    Is passed down to thread task as well.
+ * @param thread Output to the thread to be created.
+ * @return
+ */
+static inline at_error_t atCreateThread(atPool* pool, f64 update_freq, atThread* thread) {
+    if (!thread) { return AT_NULL_INPUT; }
 
-    *thread = (atThread){ .task           = (atTask){},
-                          .work_cond      = PTHREAD_COND_INITIALIZER,
+    *thread = (atThread){ .task           = _atCreateTask(NULL, NULL, update_freq),
                           .lock           = PTHREAD_MUTEX_INITIALIZER,
                           .pool           = pool,
-                          .pid            = 0,
-                          .update_freq_ms = (u32)(update_freq * 1000.f),
-                          .activated      = false,
-                          .exit           = false };
+                          .update_freq_ms = (u32)(update_freq * 1000.0),
+                          .exit           = false,
+                          .working        = false };
 
-    if (pthread_create(&thread->pid, NULL, _atThreadLoop, thread) != 0) { return AT_SYS_ERROR; }
+    if (pthread_create(&thread->pid, NULL, _atThreadLoop, thread)) { return AT_LIB_ERROR; }
+
+    thread->task.pid = thread->pid;
     return AT_SUCCESS;
 }
 
-static inline at_return_t atKillThread(atThread* thread) {
+/**
+ * @brief Awaits the threads current task (if it has one), and destroys it.
+ * @param thread Thread to be killed.
+ * @return
+ */
+static inline at_error_t atKillThread(atThread* thread) {
     if (!thread) { return AT_NULL_INPUT; }
 
     _at_LOCK(thread->lock);
     thread->exit = true;
     _at_UNLOCK(thread->lock);
 
-    if (pthread_join(thread->pid, NULL) != 0) { return AT_SYS_ERROR; }
+    if (pthread_join(thread->pid, NULL)) { return AT_LIB_ERROR; }
+    if (pthread_mutex_destroy(&thread->lock)) { return AT_LIB_ERROR; }
 
-    fprintf(stderr, "%lu: killed\n", thread->pid);
+    at_error_t err = _atDestroyTask(&thread->task);
+    if (err) { return err; }
+
+    return AT_SUCCESS;
+}
+
+/**
+ * @brief Forcefully kills a thread. Not as safe as 'atKillThread'.
+ * @param thread Thread to be killed.
+ * @return
+ */
+static inline at_error_t atForceKillThread(atThread* thread) {
+    if (!thread) { return AT_NULL_INPUT; }
+
+    if (pthread_cancel(thread->pid)) { return AT_LIB_ERROR; }
+    if (pthread_mutex_destroy(&thread->lock)) { return AT_LIB_ERROR; }
+
+    at_error_t err = _atDestroyTask(&thread->task);
+    if (err) { return err; }
+
     return AT_SUCCESS;
 }
 
@@ -261,6 +358,10 @@ static inline at_return_t atKillThread(atThread* thread) {
  * POOL
  * */
 
+/**
+ * @class atPool
+ * @brief Thread pool structure.
+ */
 struct atPool {
     _atQueue  free;
     atThread* pool;
@@ -268,18 +369,25 @@ struct atPool {
     u32       thread_count;
 };
 
-static inline at_return_t atCreatePool(u32 thread_count, f64 update_freq, atPool* pool) {
-    _at_ASSERT_MSG(pool != NULL, "Cannot create a pool to null output parameter.");
-    _at_ASSERT_MSG(update_freq >= 0.f, "Update frequency cannot be negative.");
+/**
+ * @brief Create a thread pool.
+ * @param thread_count Amount of threads to create.
+ * @param update_freq Frequency in which pool checks for free threads, in seconds.
+ *                    Is passed down to each thread as well.
+ * @param pool Output to the pool to be created.
+ * @return
+ */
+static inline at_error_t atCreatePool(u32 thread_count, f64 update_freq, atPool* pool) {
+    if (!pool) { return AT_NULL_INPUT; }
 
     pool->pool = malloc(sizeof(atThread) * thread_count);
     if (!pool->pool) { return AT_SYS_ERROR; }
 
-    pool->update_freq_ms = (u32)(update_freq * 1000.f);
+    pool->update_freq_ms = (u32)(update_freq * 1000.0);
     pool->thread_count   = thread_count;
     pool->free           = _atCreateQueue();
 
-    at_return_t err;
+    at_error_t err;
     for (u64 i = 0; i < thread_count; ++i) {
         if ((err = atCreateThread(pool, update_freq, &pool->pool[i]))) { return err; }
         if ((err = _atQEnqueue(&pool->free, &pool->pool[i]))) { return err; }
@@ -288,10 +396,15 @@ static inline at_return_t atCreatePool(u32 thread_count, f64 update_freq, atPool
     return AT_SUCCESS;
 }
 
-static inline at_return_t atDestroyPool(atPool* pool) {
-    _at_ASSERT_MSG(pool != NULL, "Cannot destroy null pool.");
+/**
+ * @brief Destroy a thread pool.
+ * @param pool Thread pool to be destroyed.
+ * @return
+ */
+static inline at_error_t atDestroyPool(atPool* pool) {
+    if (!pool) { return AT_NULL_INPUT; }
 
-    at_return_t err;
+    at_error_t err;
     for (u64 i = 0; i < pool->thread_count; ++i) {
         if ((err = atKillThread(&pool->pool[i]))) { return err; }
     }
@@ -306,24 +419,44 @@ static inline at_return_t atDestroyPool(atPool* pool) {
  * TASK
  * */
 
+/**
+ * @brief Launch a task with a specific thread.
+ * @param fn Task function.
+ * @param args Task function arguments.
+ * @param thread Thread to be given the task.
+ * @return Null for error.
+ */
 atTask* atLaunchTask(at_task_func_t fn, void* args, atThread* thread) {
-    _at_ASSERT_MSG(thread != NULL, "Cannot launch task with null thread.");
+    if (!fn || !thread) { return NULL; }
 
     _at_LOCK(thread->lock);
     {
-        thread->task      = _atCreateTask(fn, args);
-        thread->task.args = &thread->pid; // TODO: < remove
-        thread->activated = true;
+        if (thread->working) {
+            _at_UNLOCK(thread->lock);
+            return NULL;
+        }
+
+        thread->task.fn   = fn;
+        thread->task.args = args;
+        thread->task.done = false;
+        thread->working   = true;
     }
     _at_UNLOCK(thread->lock);
 
     return &thread->task;
 }
 
+/**
+ * @brief Schedule a task to be executed once a free thread is found.
+ * @param fn Task function.
+ * @param args Task function arguments.
+ * @param pool Pool to schedule the task with.
+ * @return Null for error.
+ */
 atTask* atScheduleTask(at_task_func_t fn, void* args, atPool* pool) {
-    _at_ASSERT_MSG(pool != NULL, "Cannot schedule task with null pool.");
+    if (!pool) { return NULL; }
 
-    while (_atQIsEmpty(&pool->free)) { usleep(pool->update_freq_ms); }
+    while (_atQIsEmpty(&pool->free, NULL)) { usleep(pool->update_freq_ms); }
 
     atThread* free_thread = _atQDequeue(&pool->free);
     return atLaunchTask(fn, args, free_thread);
@@ -333,6 +466,11 @@ atTask* atScheduleTask(at_task_func_t fn, void* args, atPool* pool) {
  * THREAD
  * */
 
+/**
+ * (internal)
+ * @brief Thread running loop.
+ * @param _arg
+ */
 void* _atThreadLoop(void* _arg) {
     atThread* thread = (atThread*)_arg;
     atTask*   task   = &thread->task;
@@ -340,16 +478,19 @@ void* _atThreadLoop(void* _arg) {
     _at_LOCK(thread->lock);
     {
         while (!thread->exit) {
-            if (!thread->activated) {
+            if (!thread->working) {
                 _at_UNLOCK(thread->lock);
                 usleep(thread->update_freq_ms);
             } else {
-                thread->activated = false;
+                thread->working = false;
                 _at_UNLOCK(thread->lock);
 
                 task->ret = task->fn(task->args);
-                fprintf(stderr, "%lu: done\n", thread->pid);
-                _at_SIGNAL(task->ret_cond);
+
+                _at_LOCK(task->lock);
+                task->done = true;
+                _at_UNLOCK(task->lock);
+
                 _atQEnqueue(&thread->pool->free, thread);
             }
 
@@ -358,8 +499,7 @@ void* _atThreadLoop(void* _arg) {
     }
     _at_UNLOCK(thread->lock);
 
-    fprintf(stderr, "%lu: exiting\n", thread->pid);
-    pthread_exit(NULL); // return NULL;
+    return NULL;
 }
 
 #endif
